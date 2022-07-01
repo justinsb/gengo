@@ -131,7 +131,7 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 		klog.Fatalf("Failed loading boilerplate: %v", err)
 	}
 
-	inputs := sets.NewString(context.Inputs...)
+	inputPackages := sets.NewString(context.Inputs...)
 	packages := generator.Packages{}
 	header := append([]byte(fmt.Sprintf("//go:build !%s\n// +build !%s\n\n", arguments.GeneratedBuildTag, arguments.GeneratedBuildTag)), boilerplate...)
 
@@ -147,11 +147,12 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 		}
 	}
 
-	for i := range inputs {
-		klog.V(5).Infof("Considering pkg %q", i)
-		pkg := context.Universe[i]
+	for inputPackage := range inputPackages {
+		klog.V(5).Infof("Considering package %q", inputPackage)
+		pkg := context.Universe.Package(inputPackage)
 		if pkg == nil {
 			// If the input had no Go files, for example.
+			klog.Infof("Skipping unknown package %q (no go files?)", inputPackage)
 			continue
 		}
 
@@ -161,7 +162,7 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 		if ptag != nil {
 			ptagValue = ptag.value
 			if ptagValue != tagValuePackage {
-				klog.Fatalf("Package %v: unsupported %s value: %q", i, tagEnabledName, ptagValue)
+				klog.Fatalf("Package %v: unsupported %s value: %q", inputPackage, tagEnabledName, ptagValue)
 			}
 			ptagRegister = ptag.register
 			klog.V(5).Infof("  tag.value: %q, tag.register: %t", ptagValue, ptagRegister)
@@ -189,7 +190,7 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 		}
 
 		if pkgNeedsGeneration {
-			klog.V(3).Infof("Package %q needs generation", i)
+			klog.V(3).Infof("Package %q needs generation", pkg.Path)
 			path := pkg.Path
 			// if the source path is within a /vendor/ directory (for example,
 			// k8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/apis/meta/v1), allow
