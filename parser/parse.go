@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"k8s.io/gengo/types"
 	"k8s.io/klog/v2"
@@ -57,8 +58,8 @@ type Builder struct {
 	buildPackages map[importPathString]*build.Package
 
 	fset *token.FileSet
-	// map of package path to list of parsed files
-	parsed map[importPathString][]parsedFile
+	// map of package paths to package parsing tracker
+	parsedPackages map[importPathString]*parsedPackage
 	// map of package path to absolute path (to prevent overlap)
 	absPaths map[importPathString]string
 
@@ -68,24 +69,22 @@ type Builder struct {
 	// Map of package path to whether the user requested it or it was from
 	// an import.
 	userRequested map[importPathString]bool
+}
 
-	// All comments from everywhere in every parsed file.
-	endLineToCommentGroup map[fileLine]*ast.CommentGroup
+type parsedPackage struct {
+	files map[string]*parsedFile
 
-	// map of package to list of packages it imports.
-	importGraph map[importPathString]map[string]struct{}
+	// set of packages this package imports.
+	importGraph map[string]struct{}
 }
 
 // parsedFile is for tracking files with name
 type parsedFile struct {
 	name string
 	file *ast.File
-}
 
-// key type for finding comments.
-type fileLine struct {
-	file string
-	line int
+	// All comments in the parsed file.
+	endLineToCommentGroup map[int]*ast.CommentGroup
 }
 
 // New constructs a new builder.
@@ -103,15 +102,13 @@ func New() *Builder {
 	// have non-CGo equivalents.
 	c.CgoEnabled = false
 	return &Builder{
-		context:               &c,
-		buildPackages:         map[importPathString]*build.Package{},
-		typeCheckedPackages:   map[importPathString]*tc.Package{},
-		fset:                  token.NewFileSet(),
-		parsed:                map[importPathString][]parsedFile{},
-		absPaths:              map[importPathString]string{},
-		userRequested:         map[importPathString]bool{},
-		endLineToCommentGroup: map[fileLine]*ast.CommentGroup{},
-		importGraph:           map[importPathString]map[string]struct{}{},
+		context:             &c,
+		buildPackages:       map[importPathString]*build.Package{},
+		typeCheckedPackages: map[importPathString]*tc.Package{},
+		fset:                token.NewFileSet(),
+		parsedPackages:      map[importPathString]*parsedPackage{},
+		absPaths:            map[importPathString]string{},
+		userRequested:       map[importPathString]bool{},
 	}
 }
 
@@ -150,6 +147,10 @@ func (b *Builder) setLoadedBuildPackage(importPath string, buildPkg *build.Packa
 // e.g. test files and files for other platforms-- there is quite a bit of
 // logic of that nature in the build package.
 func (b *Builder) importBuildPackage(dir string) (*build.Package, error) {
+	t := time.Now()
+	defer func() {
+		klog.Infof("importBuildPackage %q took %v", dir, time.Since(t))
+	}()
 	if buildPkg, ok := b.getLoadedBuildPackage(dir); ok {
 		return buildPkg, nil
 	}
@@ -171,6 +172,7 @@ func (b *Builder) importBuildPackage(dir string) (*build.Package, error) {
 	// Remember it under the user-provided name.
 	klog.V(5).Infof("saving buildPackage %s", dir)
 	b.setLoadedBuildPackage(dir, buildPkg)
+	klog.V(5).Infof("after setLoadedBuildPackage %s", dir)
 
 	return buildPkg, nil
 }
@@ -196,12 +198,27 @@ func (b *Builder) AddFileForTest(pkg string, path string, src []byte) error {
 // flag indicates whether this file was user-requested or just from following
 // the import graph.
 func (b *Builder) addFile(pkgPath importPathString, path string, src []byte, userRequested bool) error {
-	for _, p := range b.parsed[pkgPath] {
-		if path == p.name {
+	t := time.Now()
+	defer func() {
+		klog.Infof("addFile %q took %v", pkgPath, time.Since(t))
+	}()
+
+	pkg := b.parsedPackages[pkgPath]
+	if pkg == nil {
+		pkg = &parsedPackage{
+			files:       make(map[string]*parsedFile),
+			importGraph: make(map[string]struct{}),
+		}
+		b.parsedPackages[pkgPath] = pkg
+	}
+
+	for _, f := range pkg.files {
+		if path == f.name {
 			klog.V(5).Infof("addFile %s %s already parsed, skipping", pkgPath, path)
 			return nil
 		}
 	}
+
 	klog.V(6).Infof("addFile %s %s", pkgPath, path)
 	p, err := parser.ParseFile(b.fset, path, src, parser.DeclarationErrors|parser.ParseComments)
 	if err != nil {
@@ -212,20 +229,22 @@ func (b *Builder) addFile(pkgPath importPathString, path string, src []byte, use
 	// call into here without calling addDir.
 	b.userRequested[pkgPath] = userRequested || b.userRequested[pkgPath]
 
-	b.parsed[pkgPath] = append(b.parsed[pkgPath], parsedFile{path, p})
+	f := &parsedFile{
+		name:                  path,
+		file:                  p,
+		endLineToCommentGroup: make(map[int]*ast.CommentGroup),
+	}
+	pkg.files[path] = f
 	for _, c := range p.Comments {
 		position := b.fset.Position(c.End())
-		b.endLineToCommentGroup[fileLine{position.Filename, position.Line}] = c
+		f.endLineToCommentGroup[position.Line] = c
 	}
 
 	// We have to get the packages from this specific file, in case the
 	// user added individual files instead of entire directories.
-	if b.importGraph[pkgPath] == nil {
-		b.importGraph[pkgPath] = map[string]struct{}{}
-	}
 	for _, im := range p.Imports {
 		importedPath := strings.Trim(im.Path.Value, `"`)
-		b.importGraph[pkgPath][importedPath] = struct{}{}
+		pkg.importGraph[importedPath] = struct{}{}
 	}
 	return nil
 }
@@ -393,7 +412,7 @@ func (b *Builder) importPackage(dir string, userRequested bool) (*tc.Package, er
 
 	// If we have not seen this before, process it now.
 	ignoreError := false
-	if _, found := b.parsed[pkgPath]; !found {
+	if _, found := b.parsedPackages[pkgPath]; !found {
 		// Ignore errors in paths that we're importing solely because
 		// they're referenced by other packages.
 		ignoreError = true
@@ -407,6 +426,8 @@ func (b *Builder) importPackage(dir string, userRequested bool) (*tc.Package, er
 
 			return nil, err
 		}
+
+		klog.Infof("after addDir")
 
 		// Get the canonical path now that it has been added.
 		if buildPkg, _ := b.getLoadedBuildPackage(dir); buildPkg != nil {
@@ -463,13 +484,13 @@ func (b *Builder) typeCheckPackage(pkgPath importPathString, logErr bool) (*tc.P
 		// already processing this package.
 		return nil, fmt.Errorf("circular dependency for %q", pkgPath)
 	}
-	parsedFiles, ok := b.parsed[pkgPath]
+	parsedPackage, ok := b.parsedPackages[pkgPath]
 	if !ok {
 		return nil, fmt.Errorf("No files for pkg %q", pkgPath)
 	}
-	files := make([]*ast.File, len(parsedFiles))
-	for i := range parsedFiles {
-		files[i] = parsedFiles[i].file
+	files := make([]*ast.File, 0, len(parsedPackage.files))
+	for _, parsedFile := range parsedPackage.files {
+		files = append(files, parsedFile.file)
 	}
 	b.typeCheckedPackages[pkgPath] = nil
 	c := tc.Config{
@@ -518,7 +539,7 @@ func (b *Builder) FindTypes() (types.Universe, error) {
 	// Take a snapshot of pkgs to iterate, since this will recursively mutate
 	// b.parsed. Iterate in a predictable order.
 	pkgPaths := []string{}
-	for pkgPath := range b.parsed {
+	for pkgPath := range b.parsedPackages {
 		pkgPaths = append(pkgPaths, string(pkgPath))
 	}
 	sort.Strings(pkgPaths)
@@ -567,17 +588,20 @@ func (b *Builder) findTypesIn(pkgPath importPathString, u *types.Universe) error
 	u.Package(string(pkgPath)).Path = pkg.Path()
 	u.Package(string(pkgPath)).SourcePath = b.absPaths[pkgPath]
 
-	for _, f := range b.parsed[pkgPath] {
-		if _, fileName := filepath.Split(f.name); fileName == "doc.go" {
-			tp := u.Package(string(pkgPath))
-			// findTypesIn might be called multiple times. Clean up tp.Comments
-			// to avoid repeatedly fill same comments to it.
-			tp.Comments = []string{}
-			for i := range f.file.Comments {
-				tp.Comments = append(tp.Comments, splitLines(f.file.Comments[i].Text())...)
-			}
-			if f.file.Doc != nil {
-				tp.DocComments = splitLines(f.file.Doc.Text())
+	parsedPackage := b.parsedPackages[pkgPath]
+	if parsedPackage != nil {
+		for _, f := range parsedPackage.files {
+			if _, fileName := filepath.Split(f.name); fileName == "doc.go" {
+				tp := u.Package(string(pkgPath))
+				// findTypesIn might be called multiple times. Clean up tp.Comments
+				// to avoid repeatedly fill same comments to it.
+				tp.Comments = []string{}
+				for i := range f.file.Comments {
+					tp.Comments = append(tp.Comments, splitLines(f.file.Comments[i].Text())...)
+				}
+				if f.file.Doc != nil {
+					tp.DocComments = splitLines(f.file.Doc.Text())
+				}
 			}
 		}
 	}
@@ -609,8 +633,10 @@ func (b *Builder) findTypesIn(pkgPath importPathString, u *types.Universe) error
 	}
 
 	importedPkgs := []string{}
-	for k := range b.importGraph[pkgPath] {
-		importedPkgs = append(importedPkgs, string(k))
+	if parsedPackage != nil {
+		for k := range parsedPackage.importGraph {
+			importedPkgs = append(importedPkgs, string(k))
+		}
 	}
 	sort.Strings(importedPkgs)
 	for _, p := range importedPkgs {
@@ -645,8 +671,15 @@ func (b *Builder) importWithMode(dir string, mode build.ImportMode) (*build.Pack
 // if there's a comment on the line `lines` before pos, return its text, otherwise "".
 func (b *Builder) priorCommentLines(pos token.Pos, lines int) *ast.CommentGroup {
 	position := b.fset.Position(pos)
-	key := fileLine{position.Filename, position.Line - lines}
-	return b.endLineToCommentGroup[key]
+	for _, parsedPackage := range b.parsedPackages {
+		for filename, parsedFile := range parsedPackage.files {
+			if filename == position.Filename {
+				lineNumber := position.Line - lines
+				return parsedFile.endLineToCommentGroup[lineNumber]
+			}
+		}
+	}
+	return nil
 }
 
 func splitLines(str string) []string {
